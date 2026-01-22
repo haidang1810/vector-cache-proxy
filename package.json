@@ -1,6 +1,6 @@
 {
   "name": "vector-cache-proxy",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A vector-based semantic caching library with Redis for LLM responses",
   "main": "dist/index.js",
   "module": "dist/index.js",

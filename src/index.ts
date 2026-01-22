@@ -1,2 +1,2 @@
-export { VectorCacheProxy } from './VectorCacheProxy';
-export type { VectorCacheProxyConfig, CacheEntry } from './VectorCacheProxy';
+export { VectorCacheProxy } from './VectorCacheProxy.js';
+export type { VectorCacheProxyConfig, CacheEntry } from './VectorCacheProxy.js';

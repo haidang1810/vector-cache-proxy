@@ -1,198 +1,98 @@
 # Vector Cache Proxy
 
-A semantic caching library using vector embeddings and Redis to cache LLM responses. Helps reduce costs and improve response times for similar queries.
+Semantic cache for LLM responses, backed by Redis. Prompts that mean the same thing ("How to build a REST API?" / "How do I create a REST API?") share one cached answer, which cuts cost and latency.
 
-## Features
-
-- ✅ Uses vector embeddings for semantic search (no exact text match required)
-- ✅ Caches responses in Redis
-- ✅ Customizable similarity threshold
-- ✅ Multiple embedding model support
-- ✅ TypeScript support
+- Uses Redis vector search (HNSW KNN) on Redis 8+ / Redis Stack. On older Redis it falls back to an in-process scan.
+- Embeddings run locally with [`@huggingface/transformers`](https://huggingface.co/docs/transformers.js), or come from your own embedding function.
+- Entries are scoped by **context** (model, system prompt, user...), so one user's answer is never served for another context.
+- TTL, a namespace, `getOrSet` with concurrent-call deduplication, and TypeScript generics.
+- Logs nothing by default. Prompt text is never logged.
 
 ## Installation
 
 ```bash
-# With npm
 npm install vector-cache-proxy
-
-# With Bun
-bun add vector-cache-proxy
-
-# With yarn
-yarn add vector-cache-proxy
 ```
 
-## Requirements
+Requirements: Node.js >= 18 or Bun >= 1.0. For vector index search you need Redis 8+ or Redis Stack (`docker run -p 6379:6379 redis:8`). Any Redis version works in `scan` mode.
 
-- Node.js >= 18 or Bun >= 1.0.0
-- Redis server
-
-## Usage
-
-### 1. Initialize
+## Quick start
 
 ```typescript
 import { VectorCacheProxy } from 'vector-cache-proxy';
 
-const cacheProxy = new VectorCacheProxy({
-  redis: {
-    host: 'localhost',
-    port: 6379,
-    password: '', // optional
-    db: 0, // optional
-  },
-  threshold: 0.85, // Similarity threshold (0-1), default: 0.85
-  modelName: 'Xenova/all-MiniLM-L6-v2', // optional
+const cache = new VectorCacheProxy<string>({
+  redis: 'redis://localhost:6379',
+  ttl: 60 * 60 * 24, // optional, seconds
 });
 
-// Initialize the model (required)
-await cacheProxy.initialize();
+const context = { model: 'gpt-4o', systemPrompt };
+
+const answer = await cache.getOrSet(
+  question,
+  () => callLlm(question), // only runs on a cache miss
+  { context },
+);
 ```
 
-### 2. API Methods
+## API
 
-#### `getEmbedding(text: string): Promise<number[]>`
+### `new VectorCacheProxy<T>(config)`
 
-Convert text into vector embedding.
+| Option | Default | Description |
+|---|---|---|
+| `redis` | required | ioredis options, a `redis://` URL, or an existing ioredis client. A client you pass in is not closed by `close()`. |
+| `threshold` | `0.9` | Minimum cosine similarity (0–1) for a hit. |
+| `modelName` | `'Xenova/all-MiniLM-L6-v2'` | Hugging Face model for local embeddings. |
+| `embed` | – | `(text) => Promise<number[]>`. Replaces the local model, e.g. with OpenAI embeddings. |
+| `namespace` | `'vcp'` | Prefix for every Redis key this cache writes. |
+| `ttl` | none | Default expiry in seconds. |
+| `searchMode` | `'auto'` | `'index'` (Redis Query Engine), `'scan'` (in-process) or `'auto'`. |
+| `logger` | silent | `{ debug?, warn? }`. Receives scores and status, never prompt text. |
 
-```typescript
-const embedding = await cacheProxy.getEmbedding('How to train a model?');
-console.log(embedding); // [0.123, -0.456, ...]
+### Methods
+
+- `initialize(): Promise<void>`: loads the model and creates the index. It runs automatically on first use. Call it at startup to avoid a slow first request.
+- `getCache(text, { context?, threshold? }): Promise<T | null>`
+- `search(text, { context?, threshold? }): Promise<{ response, score, text, createdAt } | null>`: like `getCache`, plus the similarity score and the matched prompt.
+- `setCache(text, response, { context?, ttl? }): Promise<void>`
+- `getOrSet(text, compute, { context?, threshold?, ttl? }): Promise<T>`: returns the cached answer, or runs `compute` and caches the result. Concurrent identical calls share one `compute`.
+- `getEmbedding(text): Promise<number[]>`
+- `clearCache(): Promise<number>`: deletes every entry in the namespace and returns the number of keys removed.
+- `close(): Promise<void>`
+
+### Context
+
+`context` can be any JSON-serializable value. Entries only match lookups with an equal context (object key order does not matter). Put in it everything that changes the answer besides the prompt: model, system prompt, temperature, tools, the user or tenant for personalised answers, and previous turns for multi-turn chats.
+
+### Choosing a threshold
+
+Semantic caches fail by returning a confident wrong answer. With small embedding models, "capital of France?" and "capital of Germany?" can score above 0.85. Start strict (0.9–0.95) and check the `score` from `search()` against real traffic before lowering it.
+
+### Models
+
+| Model | Dims | Notes |
+|---|---|---|
+| `Xenova/all-MiniLM-L6-v2` | 384 | Default. Small and fast, English only. |
+| `Xenova/paraphrase-multilingual-MiniLM-L12-v2` | 384 | Use for Vietnamese and other non-English text. |
+| `Xenova/bge-small-en-v1.5` | 384 | More accurate English. |
+
+Each model and embedding size gets its own key space and index, so changing models never compares incompatible vectors. Old entries simply stop matching. Remove them with `clearCache()` or let the TTL expire them.
+
+## Migrating from 1.x
+
+- Entries written by 1.x are not read by 2.x. Run `clearCache()` from 1.x first, or delete the `cache:*` keys.
+- The default `threshold` is now `0.9` (was `0.85`).
+- Nothing is logged to the console. Pass `logger` if you want output.
+- `initialize()` is optional.
+- The `CacheEntry` type was removed. Use `CacheMatch` from `search()`.
+
+## Development
+
+```bash
+npm run typecheck
+REDIS_URL=redis://localhost:6379 npm test
 ```
-
-#### `setCache(text: string, response: any): Promise<void>`
-
-Store text query and response in cache.
-
-```typescript
-const llmResponse = {
-  answer: 'To train a model, you need data and...',
-  tokens: 150,
-  model: 'gpt-4',
-};
-
-await cacheProxy.setCache('How to train a model?', llmResponse);
-```
-
-#### `getCache(text: string): Promise<any | null>`
-
-Search for cached response by semantic similarity. Returns `null` if not found.
-
-```typescript
-// Similar query will return cached response
-const cached = await cacheProxy.getCache('What is model training?');
-
-if (cached) {
-  console.log('✅ Cache hit:', cached);
-} else {
-  console.log('❌ Cache miss, calling LLM');
-  // Call LLM and save to cache
-  const response = await callLLM(text);
-  await cacheProxy.setCache(text, response);
-}
-```
-
-### 3. Complete Example with LLM
-
-```typescript
-import { VectorCacheProxy } from 'vector-cache-proxy';
-
-const cacheProxy = new VectorCacheProxy({
-  redis: { host: 'localhost', port: 6379 },
-  threshold: 0.85,
-});
-
-await cacheProxy.initialize();
-
-async function askLLM(question: string) {
-  // Check cache first
-  const cached = await cacheProxy.getCache(question);
-
-  if (cached) {
-    console.log('✅ Using cache');
-    return cached;
-  }
-
-  // Call LLM
-  console.log('🔄 Calling LLM...');
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: 'gpt-4',
-      messages: [{ role: 'user', content: question }],
-    }),
-  });
-
-  const data = await response.json();
-
-  // Save to cache
-  await cacheProxy.setCache(question, data);
-
-  return data;
-}
-
-// Usage
-const answer1 = await askLLM('How to train a model?');
-const answer2 = await askLLM('What is model training?'); // ✅ Uses cache
-
-await cacheProxy.close();
-```
-
-### 4. Additional Methods
-
-#### `clearCache(): Promise<void>`
-
-Clear all cached entries.
-
-```typescript
-await cacheProxy.clearCache();
-```
-
-#### `close(): Promise<void>`
-
-Close Redis connection.
-
-```typescript
-await cacheProxy.close();
-```
-
-## Configuration
-
-### VectorCacheProxyConfig
-
-```typescript
-interface VectorCacheProxyConfig {
-  redis: {
-    host: string;        // Redis host
-    port: number;        // Redis port
-    username?: string;   // Redis username (optional)
-    password?: string;   // Redis password (optional)
-    db?: number;         // Redis database (optional, default: 0)
-  };
-  threshold?: number;    // Similarity threshold (0-1), default: 0.85
-  modelName?: string;    // Embedding model, default: 'Xenova/all-MiniLM-L6-v2'
-}
-```
-
-### Threshold Guidelines
-
-- `0.95+`: Very similar (nearly identical)
-- `0.85-0.95`: Semantically similar (recommended)
-- `0.70-0.85`: Related but may differ in meaning
-- `< 0.70`: Different
-
-## Supported Models
-
-The library uses `@xenova/transformers`, you can choose different models:
-
-- `Xenova/all-MiniLM-L6-v2` (default, 384 dimensions, fast)
-- `Xenova/all-mpnet-base-v2` (768 dimensions, more accurate)
-- `Xenova/paraphrase-multilingual-MiniLM-L12-v2` (better multilingual support)
 
 ## License
 
